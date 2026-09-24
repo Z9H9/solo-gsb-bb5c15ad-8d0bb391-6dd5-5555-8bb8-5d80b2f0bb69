@@ -25,6 +25,66 @@ const STATUS_TEXT = {
   closed: "已关阀",
   dead: "停水",
 };
+const SOLVER_TEXT = { base: "常规", failover: "单阀备援" };
+const KIND_TEXT = {
+  no_base_plan: "原本就没有常规可行方案",
+  no_failover_plan: "仅缺少备援方案(存在常规可行方案)",
+};
+
+// 备援情形: 全关阀清单
+function valveListTable(valveIds) {
+  if (!valveIds.length) return "<p>无需关闭任何阀门。</p>";
+  const valveCost = new Map(state.valves.map((v) => [v.id, v.cost]));
+  return `
+    <table><thead><tr><th>顺序</th><th>阀门编号</th><th>绑定管段</th><th>关闭代价</th></tr></thead>
+    <tbody>${valveIds.map((id, k) => {
+      const v = state.valves.find((x) => x.id === id) || {};
+      return `<tr><td>${k + 1}</td><td><b>${esc(id)}</b></td>
+      <td>${esc(v.segment_id || "")}</td><td>${esc(valveCost.get(id) ?? "")}</td></tr>`;
+    }).join("")}</tbody></table>`;
+}
+
+function nodeStatusTable(nodeStatus) {
+  return `
+    <table><thead><tr><th>节点</th><th>角色</th><th>状态</th><th>连通的进水点</th></tr></thead>
+    <tbody>${nodeStatus.map((n) => `
+      <tr><td>${esc(n.id)}${n.label && n.label !== n.id ? ` <span class="role-name">(${esc(n.label)})</span>` : ""}</td>
+      <td>${ROLE_TEXT[n.role]}</td>
+      <td><span class="tag ${n.status}">${STATUS_TEXT[n.status]}</span></td>
+      <td>${n.connected_inlets.length ? esc(n.connected_inlets.join(", ")) : "—"}</td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+function segmentStatusTable(segmentStatus) {
+  return `
+    <table><thead><tr><th>管段</th><th>端点</th><th>绑定阀门</th><th>状态</th></tr></thead>
+    <tbody>${segmentStatus.map((s) => `
+      <tr><td>${esc(s.id)}</td><td>${esc(s.endpoint_a)} — ${esc(s.endpoint_b)}</td>
+      <td>${s.valve_id ? esc(s.valve_id) : "—"}</td>
+      <td><span class="tag ${s.status}">${STATUS_TEXT[s.status]}</span></td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+// 一种执行情形(正常 / 某阀失效)的校验结果行
+function scenarioCheckRows(checks) {
+  return checks.map((chk) => {
+    const name = chk.scenario === "normal"
+      ? "正常执行(全部按计划关闭)"
+      : `阀门 ${esc(chk.failed_valve)} 关不上` +
+        (chk.segment_id ? ` <span class="role-name">(管段 ${esc(chk.segment_id)} 保持通水)</span>` : "");
+    const leakCell = chk.leaks_isolated
+      ? '<span class="tag supplied">全部断开</span>'
+      : `<span class="tag leak_not_isolated">仍通水: ${esc(chk.leaks_reachable.join(", "))}</span>`;
+    const keepCell = chk.keeps_supplied
+      ? '<span class="tag supplied">全部有供水</span>'
+      : `<span class="tag disconnected">断水: ${esc(chk.keeps_starved.join(", "))}</span>`;
+    const okCell = chk.ok
+      ? '<span class="tag supplied">通过</span>'
+      : '<span class="tag leak_not_isolated">不通过</span>';
+    return `<tr><td>${name}</td><td>${esc(chk.effective_closed_valves.join(", ") || "—")}</td>
+    <td>${leakCell}</td><td>${keepCell}</td><td>${okCell}</td></tr>`;
+  }).join("");
+}
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -190,17 +250,13 @@ function renderResult(r) {
   const body = $("#result-body");
 
   if (!r.feasible) {
-    banner.classList.add("bad");
-    banner.innerHTML = `<span class="big">无解</span>${esc(r.message)}`;
-    if (r.reason_detail && r.reason_detail.witness_path) {
-      banner.innerHTML += `<br><small>证据通路: ${esc(r.reason_detail.witness_path)}</small>`;
-    }
-    body.innerHTML = `
-      <div class="card"><h3>无解原因</h3>
-      <p>原因代码: <code>${esc(r.reason_code)}</code></p>
-      <p>${esc(r.message)}</p>
-      ${r.reason_detail ? `<pre>${esc(JSON.stringify(r.reason_detail, null, 2))}</pre>` : ""}
-      </div>`;
+    renderInfeasible(r, banner, body);
+    drawCanvas();
+    return;
+  }
+
+  if (r.solver === "failover") {
+    renderFailover(r, banner, body);
     drawCanvas();
     return;
   }
@@ -210,41 +266,101 @@ function renderResult(r) {
     `<span class="big">✓ 已求得最优方案</span>${esc(r.message)}` +
     `<br><small>共枚举 ${r.subset_count} 个阀门组合, 其中 ${r.isolating_subset_count} 个可隔离全部漏点。</small>`;
 
-  const closed = r.closed_valves;
-  const valveCost = new Map(state.valves.map((v) => [v.id, v.cost]));
   body.innerHTML = `
     <div class="card">
-      <h3>关阀清单（${closed.length} 个, 总代价 ${r.total_cost}）</h3>
-      ${closed.length === 0 ? "<p>无需关闭任何阀门。</p>" : `
-      <table><thead><tr><th>顺序</th><th>阀门编号</th><th>绑定管段</th><th>关闭代价</th></tr></thead>
-      <tbody>${closed.map((id, k) => {
-        const v = state.valves.find((x) => x.id === id) || {};
-        return `<tr><td>${k + 1}</td><td><b>${esc(id)}</b></td>
-        <td>${esc(v.segment_id || "")}</td><td>${esc(valveCost.get(id) ?? "")}</td></tr>`;
-      }).join("")}</tbody></table>`}
+      <h3>关阀清单（${r.closed_valves.length} 个, 总代价 ${r.total_cost}）</h3>
+      ${valveListTable(r.closed_valves)}
     </div>
 
     <div class="card">
       <h3>各节点隔离后供水状态</h3>
-      <table><thead><tr><th>节点</th><th>角色</th><th>状态</th><th>连通的进水点</th></tr></thead>
-      <tbody>${r.node_status.map((n) => `
-        <tr><td>${esc(n.id)}${n.label && n.label !== n.id ? ` <span class="role-name">(${esc(n.label)})</span>` : ""}</td>
-        <td>${ROLE_TEXT[n.role]}</td>
-        <td><span class="tag ${n.status}">${STATUS_TEXT[n.status]}</span></td>
-        <td>${n.connected_inlets.length ? esc(n.connected_inlets.join(", ")) : "—"}</td></tr>`).join("")}
-      </tbody></table>
+      ${nodeStatusTable(r.node_status)}
     </div>
 
     <div class="card">
       <h3>各管段状态</h3>
-      <table><thead><tr><th>管段</th><th>端点</th><th>绑定阀门</th><th>状态</th></tr></thead>
-      <tbody>${r.segment_status.map((s) => `
-        <tr><td>${esc(s.id)}</td><td>${esc(s.endpoint_a)} — ${esc(s.endpoint_b)}</td>
-        <td>${s.valve_id ? esc(s.valve_id) : "—"}</td>
-        <td><span class="tag ${s.status}">${STATUS_TEXT[s.status]}</span></td></tr>`).join("")}
-      </tbody></table>
+      ${segmentStatusTable(r.segment_status)}
     </div>`;
   drawCanvas();
+}
+
+function renderInfeasible(r, banner, body) {
+  banner.classList.add("bad");
+  let head = "无解";
+  if (r.solver === "failover") {
+    head = r.infeasible_kind === "no_failover_plan"
+      ? "无备援方案"
+      : "备援无解(常规规划本身无解)";
+  }
+  banner.innerHTML = `<span class="big">${head}</span>${esc(r.message)}`;
+  if (r.reason_detail && r.reason_detail.witness_path) {
+    banner.innerHTML += `<br><small>证据通路: ${esc(r.reason_detail.witness_path)}</small>`;
+  }
+
+  let kindNote = "";
+  if (r.solver === "failover") {
+    kindNote = `
+      <p>无解类别: <code>${esc(r.infeasible_kind || "")}</code>
+      （${esc(KIND_TEXT[r.infeasible_kind] || "")}）</p>`;
+  }
+
+  // 仅缺少备援方案时, 展示最优常规方案逐阀失效的校验结果
+  let bestBase = "";
+  const bp = r.reason_detail && r.reason_detail.best_base_plan;
+  if (bp) {
+    bestBase = `
+      <div class="card">
+        <h3>最优常规方案的单阀失效校验（说明为何缺少备援）</h3>
+        <p class="role-name">常规方案关闭: ${esc((bp.closed_valves || []).join(", ") || "(无)")}
+        ，总代价 ${esc(bp.total_cost)}。下列任一计划阀门关不上都会导致方案失效。</p>
+        ${bp.failure_checks && bp.failure_checks.length ? `
+        <table><thead><tr><th>失效情形</th><th>实际关闭阀门</th><th>漏点</th><th>必保点</th><th>校验</th></tr></thead>
+        <tbody>${scenarioCheckRows(bp.failure_checks)}</tbody></table>` : "<p>该常规方案不关闭任何阀门。</p>"}
+      </div>`;
+  }
+
+  body.innerHTML = `
+    <div class="card"><h3>无解原因</h3>
+      <p>原因代码: <code>${esc(r.reason_code)}</code></p>
+      ${kindNote}
+      <p>${esc(r.message)}</p>
+      ${r.reason_detail ? `<pre>${esc(JSON.stringify(r.reason_detail, null, 2))}</pre>` : ""}
+    </div>${bestBase}`;
+}
+
+function renderFailover(r, banner, body) {
+  banner.classList.add("ok");
+  banner.innerHTML =
+    `<span class="big">✓ 已求得单阀失效备援方案</span>${esc(r.message)}` +
+    `<br><small>共枚举 ${r.subset_count} 个阀门组合: 常规可行 ${r.base_feasible_subset_count} 个, ` +
+    `其中 ${r.failover_candidate_count} 个可承受任意单阀关不上。</small>`;
+
+  const allChecks = [r.normal_check, ...r.failure_checks];
+  body.innerHTML = `
+    <div class="card">
+      <h3>备援关阀清单（${r.closed_valves.length} 个, 总代价 ${r.total_cost}）</h3>
+      ${valveListTable(r.closed_valves)}
+      <p class="role-name">目标: 最小化计划关闭阀门的代价总和; 同代价时取编号升序表字典序最小者。</p>
+    </div>
+
+    <div class="card">
+      <h3>逐阀失效校验（共 ${allChecks.length} 种情形: 正常执行 + ${r.failure_checks.length} 种单阀关不上）</h3>
+      <table><thead><tr>
+        <th>情形</th><th>实际关闭阀门</th><th>全部漏点与进水点断开</th>
+        <th>全部必保点仍有供水</th><th>校验</th>
+      </tr></thead>
+      <tbody>${scenarioCheckRows(allChecks)}</tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>各节点供水状态（正常执行时）</h3>
+      ${nodeStatusTable(r.node_status)}
+    </div>
+
+    <div class="card">
+      <h3>各管段状态（正常执行时）</h3>
+      ${segmentStatusTable(r.segment_status)}
+    </div>`;
 }
 
 // ---------- 历史 ----------
@@ -254,12 +370,13 @@ async function loadHistory() {
     ? data.plans.map((p) => `
       <tr>
         <td>${p.id}</td><td>${esc(p.created_at.replace("+00:00", "Z"))}</td>
+        <td><span class="tag ${p.solver === "failover" ? "flowing" : "dead"}">${esc(SOLVER_TEXT[p.solver] || p.solver || "常规")}</span></td>
         <td>${p.feasible ? '<span class="tag supplied">可行</span>' : '<span class="tag leak_not_isolated">无解</span>'}</td>
         <td>${p.total_cost ?? "—"}</td>
         <td>${p.closed_valves.map(esc).join(", ") || "—"}</td>
         <td><button data-view="${p.id}" class="secondary">查看</button></td>
       </tr>`).join("")
-    : `<tr><td colspan="6" class="role-name">暂无历史方案</td></tr>`;
+    : `<tr><td colspan="7" class="role-name">暂无历史方案</td></tr>`;
 }
 
 $("#table-plans").addEventListener("click", async (e) => {
@@ -309,6 +426,18 @@ $("#btn-plan").addEventListener("click", async () => {
   clearErrors();
   try {
     const r = await api("POST", "/api/plan", payloadFromUI());
+    renderResult(r);
+    loadHistory();
+    $("#section-result").scrollIntoView({ behavior: "smooth" });
+  } catch (err) {
+    showErrors(String(err.message).split("\n"));
+  }
+});
+
+$("#btn-plan-failover").addEventListener("click", async () => {
+  clearErrors();
+  try {
+    const r = await api("POST", "/api/plan-failover", payloadFromUI());
     renderResult(r);
     loadHistory();
     $("#section-result").scrollIntoView({ behavior: "smooth" });

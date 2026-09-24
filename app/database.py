@@ -124,19 +124,25 @@ def save_plan(conn: sqlite3.Connection, result: dict, snapshot: dict) -> int:
 
 def list_plans(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     rows = conn.execute(
-        "SELECT id, created_at, feasible, total_cost, closed_valves "
+        "SELECT id, created_at, feasible, total_cost, closed_valves, result "
         "FROM plans ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
-    return [
-        {
+    plans = []
+    for r in rows:
+        # 求解器类型存在 result JSON 中; 早期记录没有该字段时视为常规规划
+        try:
+            solver_kind = json.loads(r["result"]).get("solver", "base")
+        except (ValueError, TypeError):
+            solver_kind = "base"
+        plans.append({
             "id": r["id"],
             "created_at": r["created_at"],
             "feasible": bool(r["feasible"]),
             "total_cost": r["total_cost"],
             "closed_valves": json.loads(r["closed_valves"]),
-        }
-        for r in rows
-    ]
+            "solver": solver_kind,
+        })
+    return plans
 
 
 def get_plan(conn: sqlite3.Connection, plan_id: int) -> dict | None:
