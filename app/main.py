@@ -4,6 +4,7 @@ API:
   GET  /api/network                 读取当前管网输入
   PUT  /api/network                 整体保存管网输入(校验后覆盖)
   POST /api/plan                    求解并保存方案
+  POST /api/plan/failsafe           单阀失效备援求解(独立, 不入历史库)
   GET  /api/plans                   最近方案列表
   GET  /api/plans/{id}              方案详情(含节点/管段状态)
   POST /api/demo                    恢复内置示例管网
@@ -23,7 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 
 import database
 from demo import DEMO_NETWORK
-from solver import MAX_VALVES, NetworkValidationError, solve
+from solver import MAX_VALVES, NetworkValidationError, solve, solve_failsafe
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -120,6 +121,21 @@ def create_plan(net: NetworkIn | None = None) -> dict:
         plan_id = database.save_plan(conn, result, payload)
     result["id"] = plan_id
     return result
+
+
+@app.post("/api/plan/failsafe")
+def create_failsafe_plan(net: NetworkIn | None = None) -> dict:
+    """单阀失效备援求解。独立 API: 复用同一套输入校验, 结果不写入历史库。
+
+    请求体可空: 为空时使用数据库中当前编辑(已保存)的管网。
+    """
+    with database.get_conn() as conn:
+        payload = _payload(net) if net is not None else database.load_network(conn)
+    try:
+        return solve_failsafe(payload)
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422,
+                            detail={"errors": exc.errors})
 
 
 @app.get("/api/plans")
